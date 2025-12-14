@@ -229,11 +229,17 @@ def delete_old_episodes(last_watched: int, show_id: int):
     cursor.execute("DELETE FROM new_episodes WHERE show_id = ? AND number <= ?", (show_id, last_watched))
     conn.commit()
 
-def print_episode(shows, ep):
-    show_name = next(s[2] for s in shows if s[0] == ep["show_id"])
+def print_episode(show_name, ep):
     print(
         f"[{show_name}] Ep {ep['number']}: {ep['title']} "
         f"(show status = {ep['status']}, rating = {ep['rating']})"
+    )
+
+def print_show(show):
+    print(
+        f"Series name: {show[2]}, status: {show[3]}, latest episode: {show[4]}, "
+        f"last episode watched: {show[5]}, your rating: {show[6]}, "
+        f"notifications: {'ON' if show[8] == True else 'OFF'}"
     )
 
 #
@@ -341,24 +347,59 @@ def delete(name: Annotated[str, Argument(help = "Name of show you want to delete
     conn.commit()
     print("Deleted succesfully.")
 
-
 @app.command(help = "Command for listing shows")
 def catalog(
-    shows: Annotated[bool, Option("-s", " /-ns", help = "Flag for if you want to list shows instead of episodes")] = None,
-    
+    sort_by_date: Annotated[bool, Option("--date", "-d", help = "Sort shows by date")] = False,
+    sort_by_rating: Annotated[bool, Option("--rating", "-r", help="Sort shows by rating")] = False,
+    sort_by_name: Annotated[bool, Option("--name", "-n", help = "Sort shows by name")] = False,
+    group_by_status: Annotated[bool, Option("--group-watch", "-w", help="Group by watching status")] = False,
+    filter_by_status: Annotated[Optional[list[Status]], Option("--filter", "-f", help="Filter by status")] = None,
 ):
-    command = """SELECT * FROM shows"""
-    try:
-        cursor.execute(command)
-        for show in cursor.fetchall():
-            print(show)
-        # cursor.execute("SELECT * from new_episodes")
-        # for ep in cursor.fetchall(): 
-        #     print(ep)
-        # delete("Pluribus")
-    except sqlite3.Error as e:
-        print("List command fail: ", e)
-        conn.rollback()
+    where_clause = ""
+    if filter_by_status:
+        statuses = [s.value for s in filter_by_status]
+        placeholders = ", ".join("?" for _ in statuses)
+        where_clause = f" WHERE status IN ({placeholders})"
+
+    command = f"SELECT * FROM shows{where_clause}"
+    cursor.execute(command)
+    shows = cursor.fetchall()
+    
+    sort_key = sum(bool(key) for key in [sort_by_date, sort_by_name, sort_by_rating])
+
+    if sort_key > 1:
+        raise typer.Exit("Enter only one of the sorting flags --date, --rating or --name.")
+
+    if sort_by_rating:
+        shows = sorted(shows, key = lambda x: x[6])
+    elif sort_by_name:
+        shows = sorted(shows, key = lambda x: x[2])
+    else:
+        shows = sorted(shows, key = lambda x: x[0])
+
+    if group_by_status:
+        statuses = ["watched", "dropped", "on_hold", "plan_to_watch", "watching"]
+        
+        shows_by_status = []
+        for show in shows:
+            shows_by_status[show[3]].append(show)
+        
+        for status in statuses:
+            if status not in shows_by_status:
+                continue
+
+            print(f"For {status}")
+
+            for show in shows_by_status:
+                print_show(show)
+        return
+    
+
+    for show in shows:
+        print_show(show)
+
+            
+    
 
 @app.command(help = "Flips the notify flag for a show.")
 def notify(name: Annotated[str, Argument(help = "Name of the show you want to change the notify flag for.")]):
@@ -441,8 +482,9 @@ def list_cmd(
 
     if not group_by_show and not group_by_status:
         episodes.sort(key=sort_key_fn)
+        show_name = next(s[2] for s in shows if s[0] == ep["show_id"])
         for ep in episodes:
-            print_episode(shows, ep)
+            print_episode(show_name, ep)
         return
 
     if group_by_show and not group_by_status:
@@ -454,8 +496,9 @@ def list_cmd(
             show_name = next(s[2] for s in shows if s[0] == show_id)
             print(f"For {show_name}:")
             eps.sort(key=sort_key_fn)
+            show_name = next(s[2] for s in shows if s[0] == ep["show_id"])
             for ep in eps:
-                print_episode(shows, ep)
+                print_episode(show_name, ep)
             print()
         return
 
@@ -475,8 +518,9 @@ def list_cmd(
             print(f"Status: {status}")
             eps = episodes_by_status[status]
             eps.sort(key=sort_key_fn)
+            show_name = next(s[2] for s in shows if s[0] == ep["show_id"])
             for ep in eps:
-                print_episode(shows, ep)
+                print_episode(show_name, ep)
             print()
         return
 
@@ -496,7 +540,7 @@ def list_cmd(
 
             eps.sort(key=sort_key_fn)
             for ep in eps:
-                print_episode(shows, ep)
+                print_episode(show_name, ep)
             print()
     return
 
