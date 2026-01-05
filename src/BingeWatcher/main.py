@@ -1,23 +1,19 @@
-import sqlite3;
-import typer;
-import json;
 import os
-from typing_extensions import Annotated;
-from typing_extensions import Optional;
-from typer import Argument;
-from typer import Option;
-from enum import Enum;
-from urllib.parse import urlparse;
-from urllib.request import urlopen, Request;
+import sqlite3
+import json
+from enum import Enum
 from datetime import date
+from urllib.parse import urlparse
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
+from contextlib import contextmanager
+
+import typer
+from typer import Argument, Option
+from typing_extensions import Annotated, Optional
 from googleapiclient.discovery import build
 
-__version__ = "0.0.3"
-
-def version_callback(value: bool):
-    if value:
-        print(f"BingeWatch Version: {__version__}")
-        raise typer.Exit()
+__version__ = "0.0.4"
 
 app = typer.Typer(
     add_completion=False,
@@ -26,29 +22,60 @@ app = typer.Typer(
     },
 )
 
-@app.callback()
-def main(
-    version: Annotated[
-        Optional[bool],
-        typer.Option(
-            "--version", "-v", callback=version_callback, is_eager=True, help="Show the version and exit."
-        )
-    ] = None,
-):
-    """
-    BingeWatch CLI tool
-    """
-
-conn = sqlite3.connect("bingewatcher.db")
-conn.execute("PRAGMA foreign_keys = ON")
-cursor = conn.cursor()
-
 class Status(str, Enum):
     plan_to_watch = "plan_to_watch"
     watching = "watching"
     on_hold = "on_hold"
     dropped = "dropped"
     watched = "watched"
+
+conn = sqlite3.connect("bingewatcher.db")
+conn.execute("PRAGMA foreign_keys = ON")
+cursor = conn.cursor()
+
+
+@contextmanager
+def db_transaction():
+    try:
+        yield cursor
+        conn.commit()
+    except sqlite3.IntegrityError as e:
+        conn.rollback()
+        if "UNIQUE constraint failed" in str(e):
+            raise typer.Exit("Error: This show is already in your list.")
+        else:
+            raise typer.Exit(f"Database Integrity Error: {e}")
+    except sqlite3.Error as e:
+        conn.rollback()
+        raise typer.Exit(f"Database System Error: {e}")
+    except Exception as e:
+        conn.rollback()
+        raise typer.Exit(f"Unexpected Error: {e}")
+
+
+def version_callback(value: bool):
+    if value:
+        print(f"BingeWatcher Version: {__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    version: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--version",
+            "-v",
+            callback=version_callback,
+            is_eager=True,
+            help="Show the version and exit."
+        )
+    ] = None,
+):
+    """
+    BingeWatcher CLI tool
+    """
+
 
 def init_db():
     schema = """CREATE TABLE IF NOT EXISTS shows(
@@ -80,10 +107,10 @@ def init_db():
     """
     cursor.executescript(schema)
 
-try:
+
+with db_transaction():
     init_db()
-except sqlite3.Error as e:
-    print("Initiation of database error: ", e)
+
 
 def get_title_id(link: str) -> str:
     schema = urlparse(link)
@@ -102,6 +129,7 @@ def get_title_id(link: str) -> str:
         return ""
     return resource[2]
 
+
 def is_show(title_id: str) -> bool:
     url = f"https://api.imdbapi.dev/titles/{title_id}"
 
@@ -116,29 +144,38 @@ def is_show(title_id: str) -> bool:
     with urlopen(req) as response:
         body = json.load(response)
 
-    # body = json.load(body)
-    # print(json.loads(body))
     if body["type"] in ["tvSeries", "tvMiniSeries"]:
         return True
 
     return False
 
-def fetch_page(url: str) -> dict:
-        req = Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:145.0) Gecko/20100101 Firefox/145.0"
-            },
-            method="GET",
-        )
 
+def fetch_page(url: str) -> dict:
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:145.0) Gecko/20100101 Firefox/145.0"
+        },
+        method="GET",
+    )
+
+    try:
         with urlopen(req) as response:
             return json.load(response)
+    except HTTPError as e:
+        raise typer.Exit(f"API Error ({e.code}): {e.reason}")
+    except URLError as e:
+        raise typer.Exit(f"Network Connection Error: {e.reason}")
+    except json.JSONDecodeError:
+        raise typer.Exit("Error: Invalid response from API.")
+
 
 def get_episodes(title_id: str) -> list[dict]:
     url_base = f"https://api.imdbapi.dev/titles/{title_id}/episodes?pageSize=50"
 
-    cursor.execute("SELECT last_page_token, latest_episode FROM shows WHERE title_id = ?", (title_id,))
+    with db_transaction():
+        cursor.execute("SELECT last_page_token, latest_episode FROM shows WHERE title_id = ?", (title_id,))
+
     last_page_token, latest_episode = cursor.fetchone()
 
     if last_page_token:
@@ -160,8 +197,8 @@ def get_episodes(title_id: str) -> list[dict]:
         last_page_token = page_token
         page_token = data.get("nextPageToken", "")
 
-    cursor.execute("UPDATE shows SET last_page_token = ? WHERE title_id = ?", (last_page_token, title_id))
-    conn.commit()
+    with db_transaction():
+        cursor.execute("UPDATE shows SET last_page_token = ? WHERE title_id = ?", (last_page_token, title_id))
 
     episode_list = []
 
@@ -190,27 +227,35 @@ def get_episodes(title_id: str) -> list[dict]:
 
     return episode_list
 
+
 def set_new_episodes(episode_list: list, show_id: int):
     command = "INSERT INTO new_episodes (show_id, number, title, plot, rating) VALUES (?,?,?,?,?)"
-    cursor.execute("SELECT name, last_watched, latest_episode FROM shows WHERE id = ?", (show_id,))
+
+    with db_transaction():
+        cursor.execute("SELECT name, last_watched, latest_episode FROM shows WHERE id = ?", (show_id,))
+
     name, last_watched, latest_episode = cursor.fetchone()
     for episode in episode_list:
         if episode["nr"] > last_watched and episode["nr"] > latest_episode:
-            cursor.execute(command, (show_id, episode["nr"], episode["title"], episode["plot"], episode["rating"]))
+            with db_transaction():
+                cursor.execute(command, (show_id, episode["nr"], episode["title"], episode["plot"], episode["rating"]))
     
     if len(episode_list) >= latest_episode:
         get_video_for_latest_episode(episode_list[len(episode_list)-1]["nr"], name)
     
-    conn.commit()
 
 def delete_old_episodes(last_watched: int, show_id: int):
-    cursor.execute("DELETE FROM new_episodes WHERE show_id = ? AND number <= ?", (show_id, last_watched))
-    conn.commit()
+    with db_transaction():
+        cursor.execute("DELETE FROM new_episodes WHERE show_id = ? AND number <= ?", (show_id, last_watched))
+
 
 def print_episode(show_name, ep, latest_episode):
     if latest_episode == ep["number"]:
         video_related = ""
-        cursor.execute("SELECT has_trailer, has_related_video, video_link FROM shows WHERE name = ?", (show_name,))
+
+        with db_transaction():
+            cursor.execute("SELECT has_trailer, has_related_video, video_link FROM shows WHERE name = ?", (show_name,))
+    
         has_trailer, has_related_video, video_link = cursor.fetchone()
         if has_trailer:
             video_related = f"has trailer on YouTube at: {video_link}"
@@ -227,44 +272,48 @@ def print_episode(show_name, ep, latest_episode):
 
     print(
         f"[{show_name}] Ep {ep['number']}: {ep['title']} "
-        f"(show status = {ep['status']}, rating = {ep['rating']}"
+        f"(show status = {ep['status']}, rating = {ep['rating']})"
     )
+
 
 def print_show(show):
     print(
         f"Series name: {show[2]}, status: {show[3]}, latest episode: {show[4]}, "
         f"last episode watched: {show[5]}, your rating: {show[6]}, "
-        f"notifications: {'ON' if show[8] == True else 'OFF'}"
+        f"notifications: {'ON' if show[8] else 'OFF'}"
     )
 
-def get_api_key():
+
+def get_api_key() -> str:
     env_key = os.getenv("YOUTUBE_API_KEY")
     if env_key:
         return env_key
 
     return ""
 
+
 def get_youtube_videos(query, nr_of_videos) -> list:
-    developerKey=get_api_key()
-    if not developerKey:
+    developer_key = get_api_key()
+    if not developer_key:
         return []
     
     youtube = build(
         "youtube",
         "v3",
-        developerKey
+        developer_key
     )
 
     request = youtube.search().list(
-        part = "snippet",
-        maxResults = nr_of_videos,
-        q = query,
-        type = "video",
-        videoDuration = "short"
+        part="snippet",
+        maxResults=nr_of_videos,
+        q=query,
+        type="video",
+        videoDuration="short"
     )
     response = request.execute()
 
     return response.get("items", [])
+
 
 def get_video_for_latest_episode(episode_nr, show_name: str):
     
@@ -291,13 +340,16 @@ def get_video_for_latest_episode(episode_nr, show_name: str):
 
     if set_clause:
         command = f"UPDATE shows SET {set_clause} WHERE name = ?"
-        cursor.execute(command, (show_name,))
-        conn.commit()
+        with db_transaction():
+            cursor.execute(command, (show_name,))
 
-@app.command(help = "Refresh shows for new episodes")
+
+@app.command(help="Refresh shows for new episodes")
 def refresh():
     command = "SELECT id, title_id FROM shows WHERE notify = 1"
-    cursor.execute(command)
+    
+    with db_transaction():
+        cursor.execute(command)
 
     rows = cursor.fetchall()
 
@@ -308,18 +360,20 @@ def refresh():
     for (show_id, title_id) in rows:
         episode_list = get_episodes(title_id)
         set_new_episodes(episode_list, show_id)
-        cursor.execute(f"UPDATE shows SET latest_episode = ? WHERE id = ?", (len(episode_list), show_id))
-        conn.commit()
+    
+        with db_transaction():
+            cursor.execute(f"UPDATE shows SET latest_episode = ? WHERE id = ?", (len(episode_list), show_id))
 
-@app.command(help = "Add tv shows into your local storage")
+
+@app.command(help="Add tv shows into your local storage")
 def add(
-    name: Annotated[str, Argument(help = "Name of the show.")], 
-    imdb_link: Annotated[str, Argument(help = "Link to the IMDb page for the show.")], 
-    status: Annotated[Status, Option("--status", "-s", help = "Watching status of the show.")] = "watching", 
-    last_watched: Annotated[int, Option("--last-watched", "-l", help = "Number of the last watched episode.")] = None,
-    rating: Annotated[float, Option("--rating", "-r", help = "Rating for the show between 1 and 10.")] = 0, 
-    notify: Annotated[bool, Option(" /--notify", " /-n", help = "Flag for if you DON'T want to be notified of new content.")] = True
-):    
+        name: Annotated[str, Argument(help="Name of the show.")], 
+        imdb_link: Annotated[str, Argument(help="Link to the IMDb page for the show.")], 
+        status: Annotated[Status, Option("--status", "-s", help="Watching status of the show.")] = "watching", 
+        last_watched: Annotated[int, Option("--last-watched", "-l", help="Number of the last watched episode.")] = None,
+        rating: Annotated[float, Option("--rating", "-r", help="Rating for the show between 1 and 10.")] = 0, 
+        notify: Annotated[bool, Option(" /--notify", " /-n", help="Flag for if you DON'T want to be notified of new content.")] = True):
+    
     command = "INSERT INTO shows (title_id, name, imdb_link, status, latest_episode, last_watched, rating, notify) VALUES (?,?,?,?,?,?,?,?)"
     
     title_id = get_title_id(imdb_link) 
@@ -330,38 +384,40 @@ def add(
     if not is_show(title_id):
         raise typer.Exit("Not a show.")
     
-    if last_watched == None:
+    if last_watched is None:
         if status == "watched":
             last_watched = len(episode_list)
         else:
             last_watched = 0
 
-    cursor.execute(command, (title_id, name, imdb_link, status, 0, last_watched, rating, notify))
-    cursor.execute("SELECT id FROM shows WHERE name = ?", (name,))
+    with db_transaction():
+        cursor.execute(command, (title_id, name, imdb_link, status, 0, last_watched, rating, notify))
+        cursor.execute("SELECT id FROM shows WHERE name = ?", (name,))
+
     show_id = cursor.fetchone()[0]
-    conn.commit()
 
     episode_list = get_episodes(title_id)
 
     if notify and len(episode_list) != last_watched:
         api_check = get_api_key()
         if not api_check:
-            typer.echo("YOUTUBE_API_KEY not set as an environment variable.\nWe can't check for youtube related media for show.")
+            typer.echo("YOUTUBE_API_KEY not set as an environment variable.")
+            typer.echo("We can't check for youtube related media for show.")
         set_new_episodes(episode_list, show_id)
 
-    cursor.execute(f"UPDATE shows SET latest_episode = ? WHERE name = ?", (len(episode_list), name))
-    conn.commit()
+    with db_transaction():
+        cursor.execute(f"UPDATE shows SET latest_episode = ? WHERE name = ?", (len(episode_list), name))
 
-@app.command(help = "Update information about shows")
+
+@app.command(help="Update information about shows")
 def update(
-    name: Annotated[str, Argument(help = "Name of show you want to update.")],
-    new_name: Annotated[str, Option("--new-name", "-n", help = "Update name of show to new_name.")] = None,
-    last_watched: Annotated[int, Option("--last-watched", "-l", help = "Update number of the last watched episode.")] = None,
-    rating: Annotated[float, Option("--rating", "-r", help = "Update the rating of show.")] = None,
-    notify: Annotated[int, Option("--notify", "-t", help = "Update notification status for show.")] = None,
-    status: Annotated[Status, Option("--status", "-s", help = "Update watching status for show.")] = None
-):
-
+        name: Annotated[str, Argument(help="Name of show you want to update.")],
+        new_name: Annotated[str, Option("--new-name", "-n", help="Update name of show to new_name.")] = None,
+        last_watched: Annotated[int, Option("--last-watched", "-l", help="Update number of the last watched episode.")] = None,
+        rating: Annotated[float, Option("--rating", "-r", help="Update the rating of show.")] = None,
+        notify: Annotated[int, Option("--notify", "-t", help="Update notification status for show.")] = None,
+        status: Annotated[Status, Option("--status", "-s", help="Update watching status for show.")] = None):
+    
     updates = {}
     if new_name:
         updates["name"] = new_name
@@ -382,7 +438,9 @@ def update(
     if not updates:
         return
 
-    cursor.execute("SELECT id, latest_episode FROM shows WHERE name = ?", (name,))
+    with db_transaction():
+        cursor.execute("SELECT id, latest_episode FROM shows WHERE name = ?", (name,))
+    
     aux = cursor.fetchone()
     if aux is None:
         raise typer.Exit(f"No show found with name '{name}'.")
@@ -390,38 +448,42 @@ def update(
     show_id = aux[0]
     latest_episode = aux[1]
     
-    if last_watched == None and status == "watched":
+    if last_watched is None and status == "watched":
             updates["last_watched"] = latest_episode 
 
     set_clause = ", ".join(f"{col} = ?" for col in updates.keys())
     command = f"UPDATE shows SET {set_clause} WHERE name = ?"
 
     params = list(updates.values()) + [name]
-    cursor.execute(command, params)
-    conn.commit()
-    
+
+    with db_transaction():
+        cursor.execute(command, params)
+
     if last_watched:
         delete_old_episodes(last_watched, show_id)
 
-@app.command(help = "Delete one show from storage")
-def delete(name: Annotated[str, Argument(help = "Name of show you want to delete.")]):
+
+@app.command(help="Delete one show from storage")
+def delete(name: Annotated[str, Argument(help="Name of show you want to delete.")]):
     delete = typer.confirm(f"Are you sure you want to delete {name}?")
     if not delete:
         raise typer.Exit("Delete canceled.")
     command = "DELETE FROM shows WHERE name = ?"
-    cursor.execute(command, (name,))
+
+    with db_transaction():
+        cursor.execute(command, (name,))
     
-    conn.commit()
     print("Deleted succesfully.")
 
-@app.command(help = "Command for listing shows")
+
+@app.command(help="Command for listing shows")
 def catalog(
-    sort_by_date: Annotated[bool, Option("--date", "-d", help = "Sort shows by date")] = False,
-    sort_by_rating: Annotated[bool, Option("--rating", "-r", help="Sort shows by rating")] = False,
-    sort_by_name: Annotated[bool, Option("--name", "-n", help = "Sort shows by name")] = False,
-    group_by_status: Annotated[bool, Option("--group-watch", "-w", help="Group by watching status")] = False,
-    filter_by_status: Annotated[Optional[list[Status]], Option("--filter", "-f", help="Filter by status")] = None,
-):
+        sort_by_date: Annotated[bool, Option("--date", "-d", help="Sort shows by date")] = False,
+        sort_by_rating: Annotated[bool, Option("--rating", "-r", help="Sort shows by rating")] = False,
+        sort_by_name: Annotated[bool, Option("--name", "-n", help="Sort shows by name")] = False,
+        group_by_status: Annotated[bool, Option("--group-watch", "-w", help="Group by watching status")] = False,
+        filter_by_status: Annotated[Optional[list[Status]], Option("--filter", "-f", help="Filter by status")] = None):
+    
     where_clause = ""
     if filter_by_status:
         statuses = [s.value for s in filter_by_status]
@@ -429,7 +491,9 @@ def catalog(
         where_clause = f" WHERE status IN ({placeholders})"
 
     command = f"SELECT * FROM shows{where_clause}"
-    cursor.execute(command)
+    with db_transaction():
+        cursor.execute(command)
+    
     shows = cursor.fetchall()
     
     sort_key = sum(bool(key) for key in [sort_by_date, sort_by_name, sort_by_rating])
@@ -461,28 +525,31 @@ def catalog(
                 print_show(show)
         return
     
-
     for show in shows:
         print_show(show)
 
-@app.command(help = "Flips the notify flag for a show.")
-def notify(name: Annotated[str, Argument(help = "Name of the show you want to change the notify flag for.")]):
-    cursor.execute("SELECT notify FROM shows WHERE name = ?", (name,))
+
+@app.command(help="Flips the notify flag for a show.")
+def notify(name: Annotated[str, Argument(help="Name of the show you want to change the notify flag for.")]):
+    with db_transaction():
+        cursor.execute("SELECT notify FROM shows WHERE name = ?", (name,))
+    
     notify = cursor.fetchone()[0]
     notify = 0 if notify else 1
 
-    cursor.execute("UPDATE shows SET notify = ? WHERE name = ?", (notify, name))
-    conn.commit()
+    with db_transaction():
+        cursor.execute("UPDATE shows SET notify = ? WHERE name = ?", (notify, name))
+
 
 @app.command("list", help="Command for listing new episodes")
 def list_cmd(
-    sort_by_rating: Annotated[bool, Option("--rating", "-r", help="Sort by rating")] = False,
-    sort_by_title: Annotated[bool, Option("--title", "-t", help="Sort by title alphabetically")] = False,
-    sort_by_date: Annotated[bool, Option("--date", "-d", help="(Not implemented) Sort by date")] = False,
-    group_by_show: Annotated[bool, Option("--group-show", "-s", help="Group episodes by show")] = False,
-    group_by_status: Annotated[bool, Option("--group-watch", "-w", help="Group by watching status")] = False,
-    filter_by_status: Annotated[Optional[list[Status]], Option("--filter", "-f", help="Filter by status")] = None,
-):
+        sort_by_rating: Annotated[bool, Option("--rating", "-r", help="Sort by rating")] = False,
+        sort_by_title: Annotated[bool, Option("--title", "-t", help="Sort by title alphabetically")] = False,
+        sort_by_date: Annotated[bool, Option("--date", "-d", help="(Not implemented) Sort by date")] = False,
+        group_by_show: Annotated[bool, Option("--group-show", "-s", help="Group episodes by show")] = False,
+        group_by_status: Annotated[bool, Option("--group-watch", "-w", help="Group by watching status")] = False,
+        filter_by_status: Annotated[Optional[list[Status]], Option("--filter", "-f", help="Filter by status")] = None):
+    
     sort_flags = [sort_by_rating, sort_by_title, sort_by_date]
     if sum(bool(f) for f in sort_flags) > 1:
         raise typer.Exit("Please use only one of the sorting flags: --rating, --title, or --date.")
@@ -505,7 +572,8 @@ def list_cmd(
 
     where_sql = " AND ".join(where_clauses)
 
-    cursor.execute(f"SELECT * FROM shows WHERE {where_sql}", params)
+    with db_transaction():
+        cursor.execute(f"SELECT * FROM shows WHERE {where_sql}", params)
     shows = cursor.fetchall()
 
     if not shows:
@@ -515,7 +583,10 @@ def list_cmd(
     show_statuses = {show[0]: show[3] for show in shows}
     latest_episodes = {show[2]: show[4] for show in shows}
     placeholders = ", ".join("?" for _ in show_ids)
-    cursor.execute(f"SELECT * FROM new_episodes WHERE show_id IN ({placeholders})", show_ids)
+    
+    with db_transaction():
+        cursor.execute(f"SELECT * FROM new_episodes WHERE show_id IN ({placeholders})", show_ids)
+    
     new_episodes = cursor.fetchall()
 
     if not new_episodes:
@@ -608,7 +679,8 @@ def list_cmd(
             print()
     return
 
-@app.command(help = "Seed the database with some shows")
+
+@app.command(help="Seed the database with some shows")
 def seed():
     add("Breakings Bad", "https://www.imdb.com/title/tt0903747/", "watching", 44, 8)
     add("Invincible", "https://www.imdb.com/title/tt6741278/", "watching", 10)
@@ -617,13 +689,15 @@ def seed():
     add("Pluribus", "https://www.imdb.com/title/tt22202452", "plan_to_watch", 6, 0)
 
 
-@app.command("delete_whole", help = "Delete the whole database of shows.")
+@app.command("delete_whole", help="Delete the whole database of shows.")
 def dele():
-    delete = typer.confirm(f"Are you sure you want to delete the whole database?")
+    delete = typer.confirm("Are you sure you want to delete the whole database?")
     if not delete:
         raise typer.Exit("Delete canceled.")
-    cursor.execute("DROP TABLE shows")
-    cursor.execute("DROP TABLE new_episodes")
+    
+    with db_transaction():
+        cursor.execute("DROP TABLE shows")
+        cursor.execute("DROP TABLE new_episodes")
 
 app()
 
